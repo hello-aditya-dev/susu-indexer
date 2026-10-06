@@ -357,25 +357,26 @@ export class IndexerDb {
   /**
    * Advances the checkpoint.
    *
-   * Guards against regression in the database as well as in code: the update
-   * only applies when the new ledger is strictly greater, so concurrent runs
-   * cannot move the checkpoint backwards.
+   * The advancement is monotonic at the database, not only in memory. It calls
+   * the `advance_indexer_checkpoint` SQL function (see
+   * `supabase/migrations/20260920000000_indexer_checkpoint_monotonic.sql`),
+   * which inserts the row when none exists and otherwise updates it only when
+   * the new ledger is strictly greater than the stored one. That is a single
+   * atomic statement, so out-of-order or concurrent runs cannot overwrite a
+   * newer checkpoint with an older one regardless of commit order.
+   *
+   * `updated_at` is only bumped when the row actually advances, so a replayed
+   * or overlapping run that writes a lower/equal ledger leaves the staleness
+   * timer untouched.
    */
   async advanceCheckpoint(params: {
     lastProcessedLedger: number;
     startLedger: number;
   }): Promise<void> {
-    const { error } = await this.#client
-      .from('indexer_checkpoints')
-      .upsert(
-        {
-          id: 'default',
-          last_processed_ledger: params.lastProcessedLedger,
-          start_ledger: params.startLedger,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: 'id' },
-      );
+    const { error } = await this.#client.rpc('advance_indexer_checkpoint', {
+      p_last_processed_ledger: params.lastProcessedLedger,
+      p_start_ledger: params.startLedger,
+    });
 
     if (error) {
       throw new Error(`Failed to advance indexer checkpoint: ${error.message}`);

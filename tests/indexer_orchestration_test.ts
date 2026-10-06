@@ -48,6 +48,13 @@ type StubCall = {
   op: 'select' | 'upsert' | 'insert' | 'update';
 };
 
+/** An RPC invocation recorded by the stub, for assertions on calls that go through
+ * `.rpc(...)` rather than a table builder. */
+type StubRpcCall = {
+  name: string;
+  args: Record<string, unknown>;
+};
+
 /**
  * A Supabase client stub with in-memory tables.
  *
@@ -61,6 +68,9 @@ type StubCall = {
 class StubSupabaseClient {
   readonly tables = new Map<string, Row[]>();
   readonly calls: StubCall[] = [];
+  /** RPC invocations, recorded in call order. `advance_indexer_checkpoint` lands
+   * here rather than in `calls` because it is not a table-builder operation. */
+  readonly rpcCalls: StubRpcCall[] = [];
   /** When set, this operation throws instead of executing. */
   failOn: StubCall | null = null;
   /** When set, this operation returns `{ error }` instead of executing. */
@@ -68,6 +78,40 @@ class StubSupabaseClient {
 
   from(table: string): StubBuilder {
     return new StubBuilder(this, table);
+  }
+
+  /**
+   * Simulates the PostgREST `.rpc(name, args)` surface `IndexerDb` uses.
+   *
+   * `advance_indexer_checkpoint` is mirrored with the same monotonic semantics
+   * the SQL function enforces: insert when no row exists, otherwise advance
+   * only when the new ledger is strictly greater. The real atomicity guarantee
+   * is verified against PostgreSQL by `supabase/tests/checkpoint_monotonic.sql`;
+   * the stub only keeps the orchestration flow honest about the row state.
+   */
+  rpc(name: string, args: Record<string, unknown>): Promise<{ data: unknown; error: null }> {
+    this.rpcCalls.push({ name, args: { ...args } });
+    if (name === 'advance_indexer_checkpoint') {
+      const table = this.rows('indexer_checkpoints');
+      const newLedger = Number(args['p_last_processed_ledger']);
+      const startLedger = Number(args['p_start_ledger']);
+      const existing = table.find((r) => r['id'] === 'default');
+      if (existing === undefined) {
+        table.push({
+          id: 'default',
+          last_processed_ledger: newLedger,
+          start_ledger: startLedger,
+          updated_at: new Date().toISOString(),
+        });
+      } else if (newLedger > Number(existing['last_processed_ledger'])) {
+        existing['last_processed_ledger'] = newLedger;
+        existing['updated_at'] = new Date().toISOString();
+        // start_ledger is intentionally not touched: it is set once on the
+        // initial insert and only a full rebuild (delete + re-insert) changes it.
+      }
+      // Equal or lower: no-op, matching the SQL function's WHERE clause.
+    }
+    return Promise.resolve({ data: null, error: null });
   }
 
   rows(table: string): Row[] {
@@ -347,8 +391,12 @@ Deno.test('handleRequest runs the full two-pass flow and advances the checkpoint
     const secondPass = rpc.requests.find((r) => r.contractIds.includes(GROUP_ID));
     assert(secondPass !== undefined, 'expected a second scan for the discovered group');
 
-    // The checkpoint advanced exactly once, to the end of the range.
-    assertEquals(stub.callsTo('indexer_checkpoints', 'upsert').length, 1);
+    // The checkpoint advanced exactly once, to the end of the range, via the
+    // atomic monotonic RPC rather than a table upsert.
+    assertEquals(
+      stub.rpcCalls.filter((c) => c.name === 'advance_indexer_checkpoint').length,
+      1,
+    );
     assertEquals(
       stub.rows('indexer_checkpoints')[0]?.['last_processed_ledger'],
       SCENARIO_HEAD,
@@ -378,7 +426,10 @@ Deno.test('a failed run records the failure and never advances the checkpoint', 
 
     // The acceptance criterion: the checkpoint is untouched, so the next run
     // retries the same range instead of skipping it.
-    assertEquals(stub.callsTo('indexer_checkpoints', 'upsert'), []);
+    assertEquals(
+      stub.rpcCalls.filter((c) => c.name === 'advance_indexer_checkpoint'),
+      [],
+    );
 
     // ...but the failure is on record for operators.
     const runs = stub.rows('indexer_runs');

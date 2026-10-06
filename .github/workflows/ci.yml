@@ -131,3 +131,11 @@ jobs:
             exit 1
           fi
           echo "anon and authenticated hold no table privileges."
+
+      - name: Verify checkpoint advancement is monotonic
+        run: |
+          set -euo pipefail
+          # Exercises the advance_indexer_checkpoint SQL function against the
+          # same Postgres the guards above use: initial insert, higher advance,
+          # equal/lower no-op, and reverse-order writes leaving the higher ledger.
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/tests/checkpoint_monotonic.sql
